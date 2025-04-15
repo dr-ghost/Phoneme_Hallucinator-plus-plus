@@ -1,0 +1,3 @@
+[submodule "models/knn-vc"]
+	path = models/knn-vc
+	url = https://github.com/bshall/knn-vc.git
