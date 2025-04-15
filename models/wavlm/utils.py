@@ -12,7 +12,7 @@ from torch.nn.utils.rnn import pad_sequence
 import os
 import gdown
 
-from ecapa_tdnn import ECAPA_TDNN_SMALL
+from .ecapa_tdnn import ECAPA_TDNN_SMALL
 
 # def load_model(filepath):
 #     state = torch.load(filepath, map_location=lambda storage, loc: storage)

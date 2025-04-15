@@ -178,21 +178,24 @@ class SetNorm(nn.Module):
         
         self.eps = eps
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        padded_x = x.to_padded_tensor(0.0) # shape (batch, max_seq_len, embed_dim)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor: 
+        """
+        x: shape (batch, max_seq_len, embed_dim)
+        mask: shape (batch, max_seq_len, max(embed_dim_max, max_seq_len))
+        """      
+        batch, max_seq_len, embed_dim = x.shape
+        device = x.device
         
-        batch, max_seq_len, embed_dim = padded_x.shape
-        device = padded_x.device
+        # lens = torch.tensor([sample.shape[0] for sample in x.unbind(0)], device=device)  # (batch,)
         
-        lens = torch.tensor([sample.shape[0] for sample in x.unbind(0)], device=device)  # (batch,)
+        # seq_range = torch.arange(max_seq_len, device=device).unsqueeze(0)  # shape (1, max_seq_len)
+        # mask_seq = seq_range < lens.unsqueeze(1) # shape (batch, max_seq_len)
         
-        seq_range = torch.arange(max_seq_len, device=device).unsqueeze(0)  # shape (1, max_seq_len)
-        mask_seq = seq_range < lens.unsqueeze(1) # shape (batch, max_seq_len)
+        # mask_expanded = repeat(mask, 'b max_sl -> b max_sl embed', embed=embed_dim)
+        mask_redacted = mask[:, :, :embed_dim]
         
-        mask_expanded = repeat(mask_seq, 'b max_sl -> b max_sl embed', embed= embed_dim)
-        
-        x_flat = rearrange(padded_x, 'b max_sl embed -> b (max_sl embed)')
-        mask_flat = rearrange(mask_expanded, 'b max_sl embed -> b (max_sl embed)')
+        x_flat = rearrange(x, 'b max_sl embed -> b (max_sl embed)')
+        mask_flat = rearrange(mask_redacted, 'b max_sl embed -> b (max_sl embed)')
         
         cnt = mask_flat.sum(dim=1, keepdim=True).clamp(min=1)
         
@@ -203,13 +206,7 @@ class SetNorm(nn.Module):
         x_norm = (x_flat - mean) / torch.sqrt(var + self.eps)
         x_norm = x_norm.view(batch, max_seq_len, embed_dim)
         
-        nested_norm = torch.nested.as_nested_tensor(
-            [padded_x[i, :lens[i]] for i in range(len(lens))],
-            dtype=padded_x.dtype,
-            device=padded_x.device
-        )
-        
-        return nested_norm
+        return x_norm
         
 
     
@@ -228,11 +225,18 @@ class SelfAttentionBlock(nn.Module):
             nn.SiLU()
         )
         
-    def forward(self, x: torch.Tensor, scale_shift: tuple = None) -> torch.Tensor:
-        dx = self.attn(x)
+    def forward(self, x: torch.Tensor, scale_shift: tuple = None, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: shape (batch, max_seq_len, embed_dim)
+        scale_shift: shape (batch, 2, embed_dim)
+        mask: shape (batch, max_seq_len, max(embed_dim_max, max_seq_len))
+        """
+        # mask_ = repeat(mask, 'b max_sl -> b max_sl max_sl')
+        
+        dx = self.attn(x, x, x, attn_mask=mask[:, :, :mask.shape[1]].transpose(1, 2))
         x = x + dx
         
-        x = self.norm(x)
+        x = self.norm(x, mask=mask)
         
         if exists(scale_shift):
             scale, shift = scale_shift
@@ -262,10 +266,11 @@ class TransformerBlock(nn.Module):
         
         self.norm = SetNorm()
         
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
         """
-        x: shape (batch, l_x, embed_dim)
+        x: shape (batch, max_seq_len, embed_dim)
         time_emb: shape (batch, time_embed_dim)
+        mask: shape (batch, max_seq_len)
         """
         scale_shift = None
         
@@ -275,14 +280,140 @@ class TransformerBlock(nn.Module):
             
             scale_shift = time_emb.chunk(2, dim=1)
             
-        h = self.block1(x, scale_shift)
-        h = self.block2(h)
+        h = self.block1(x, scale_shift, mask=mask)
+        h = self.block2(h, mask=mask)
         
-        x = self.norm(h + self.res_mlp(x))
+        x = self.norm(h + self.res_mlp(x), mask=mask)
         
         return x
+   
+class SAB(nn.Module):
+    """
+    Set Attention Block as defined in "Set Transformer" where every element
+    attends to every other element.
+    
+    Args:
+        dim (int): Input embedding dimension.
+        nheads (int): Number of attention heads.
+        dropout (float): Dropout probability.
+    """
+    def __init__(self, dim: int, nheads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        # Use MultiHeadAttention for self-attention (q=k=v)
+        self.mha = MultiHeadAttention(E_q=dim, E_k=dim, E_v=dim, E_total=dim * nheads, nheads=nheads, dropout=dropout)
+        self.norm = SetNorm()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU()
+        )
+    
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # Self-attention: output = MHA(x, x, x) with residual connection.
+        attn_out = self.mha(x, x, x, attn_mask=mask[:, :, :mask.shape[1]].transpose(1, 2))  # (B, L, D)
+        x = x + attn_out
+        x = self.norm(x, mask=mask)
+        # Apply an MLP block on each element with a residual connection.
+        mlp_out = self.mlp(x)
+        return self.norm(x + mlp_out, mask=mask)
+
+
+class ISAB(nn.Module):
+    """
+    Induced Set Attention Block uses a set of learned inducing points (I)
+    to compute a lower cost self-attention for sets.
+    
+    Args:
+        dim (int): Input embedding dimension.
+        nheads (int): Number of attention heads.
+        num_inducing (int): Number of inducing points.
+        dropout (float): Dropout probability.
+    """
+    def __init__(self, dim: int, num_inducing: int, nheads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.num_inducing = num_inducing
+        self.I = nn.Parameter(torch.randn(1, num_inducing, dim))
+        self.mab1 = MultiHeadAttention(E_q=dim, E_k=dim, E_v=dim, E_total=dim * nheads, nheads=nheads, dropout=dropout)
+        self.mab2 = MultiHeadAttention(E_q=dim, E_k=dim, E_v=dim, E_total=dim * nheads, nheads=nheads, dropout=dropout)
+        self.norm = SetNorm()
+    
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        B, L, D = x.shape
+        # Expand inducing points across batch:
+        I = repeat(I, 'b num_i d -> (repeat b) num_i d', repeat=B) # (B, num_inducing, D)
+        # First: Inducing points attend to the set.
+        H = self.mab1(I, x, x, attn_mask=mask[:, :, :mask.shape[1]].transpose(1, 2))  # (B, num_inducing, D)
+        # Second: Set elements attend to induced representations.
+        out = self.mab2(x, H, H)
         
+        return self.norm(out, mask=mask)
+
+
+class PMA(nn.Module):
+    """
+    Aggregates the set into a fixed number of output vectors by using a set
+    of learnable seed vectors.
+    
+    Args:
+        dim (int): Input embedding dimension.
+        num_seeds (int): Number of seed vectors (i.e. output set size; k).
+        nheads (int): Number of attention heads.
+        dropout (float): Dropout probability.
+    """
+    def __init__(self, dim: int, num_seeds: int, nheads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.num_seeds = num_seeds
+        self.S = nn.Parameter(torch.randn(1, num_seeds, dim))
+        self.rff = nn.Identity()
+        self.mab = MultiHeadAttention(E_q=dim, E_k=dim, E_v=dim, E_total=dim * nheads, nheads=nheads, dropout=dropout)
+    
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # x: (B, L, D). Expand seed vectors along batch.
+        B = x.shape[0]
+        S = repeat(S, 'b num_i d -> (repeat b) num_i d', repeat=B)   # (B, num_seeds, D)
+        x_processed = self.rff(x)
+        # Each seed attends to the set.
+        out = self.mab(S, x_processed, x_processed, attn_mask=mask[:, :, :mask.shape[1]].transpose(1, 2))  # (B, num_seeds, D)
+        return out  # shape: (B, num_seeds, D) 
+    
+class SetTransformer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_blocks: int = 2,
+        num_inducing: int = None,
+        num_seeds: int = 1,
+        nheads: int = 4,
+        dropout: float = 0.0
+    ):
+        """
+        SetTransformer that encodes a set and aggregates it into num_seeds outputs.
         
+        Args:
+            dim (int): Embedding dimension.
+            num_blocks (int): Number of attention blocks.
+            num_inducing (int or None): If provided, use ISAB with this many inducing points.
+            num_seeds (int): Number of seed vectors for final aggregation.
+            nheads (int): Number of heads for attention.
+            dropout (float): Dropout probability.
+        """
+        super().__init__()
+        self.encoder = nn.ModuleList()
+        for _ in range(num_blocks):
+            if exists(num_inducing):
+                self.encoder.append(ISAB(dim=dim, num_inducing=num_inducing, nheads=nheads, dropout=dropout))
+            else:
+                self.encoder.append(SAB(dim=dim, nheads=nheads, dropout=dropout))
         
-        
-        
+        self.pma = PMA(dim=dim, num_seeds=num_seeds, nheads=nheads, dropout=dropout)
+    
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: (B, L, D) — the set representation.
+        mask: optional mask tensor.
+        Returns:
+            Aggregated representation of shape (B, num_seeds, D)
+        """
+        for block in self.encoder:
+            x = block(x, mask=mask)
+        out = self.pma(x, mask=mask)
+        return out
